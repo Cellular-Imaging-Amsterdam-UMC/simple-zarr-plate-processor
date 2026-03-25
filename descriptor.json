@@ -1,0 +1,52 @@
+{
+  "name": "SimpleZarrPlateProcessor",
+  "description": "Minimal OME-ZARR plate processor with max projection and channel selection",
+  "container-image": {
+    "image": "cellularimagingcf/simple-zarr-plate-processor",
+    "type": "docker"
+  },
+  "command-line": "python wrapper.py --infolder [INFOLDER] --outfolder [OUTFOLDER] --gtfolder [GTFOLDER] --local -nmc --channel [CHANNEL] [DO_MAX_PROJ] --output_name [OUTPUT_NAME] --max_workers [MAX_WORKERS]",
+  "inputs": [
+    {
+      "id": "channel",
+      "value-key": "[CHANNEL]",
+      "command-line-flag": "--channel",
+      "name": "Channel to process",
+      "description": "Channel index to extract/process (0-based), -1 for all channels",
+      "default-value": 0,
+      "optional": true,
+      "type": "Number"
+    },
+    {
+      "id": "do_max_proj",
+      "value-key": "[DO_MAX_PROJ]",
+      "command-line-flag": "--do_max_proj",
+      "name": "Max projection",
+      "description": "Perform maximum intensity projection along Z axis",
+      "default-value": true,
+      "optional": true,
+      "type": "Boolean"
+    },
+    {
+      "id": "output_name",
+      "value-key": "[OUTPUT_NAME]",
+      "command-line-flag": "--output_name",
+      "name": "Output plate name",
+      "description": "Name for output plate (default: processed)",
+      "default-value": "processed",
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "max_workers",
+      "value-key": "[MAX_WORKERS]",
+      "command-line-flag": "--max_workers",
+      "name": "Parallel workers",
+      "description": "Maximum number of parallel worker threads for processing multiple plates",
+      "default-value": 4,
+      "optional": true,
+      "type": "Number"
+    }
+  ],
+  "schema-version": "boutiques-0.5"
+}
