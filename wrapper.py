@@ -308,7 +308,19 @@ def parse_args():
     # Processing parameters
     parser.add_argument("--channel", type=int, default=0, 
                        help="Channel to extract/process (0-based), -1 for all channels")
-    parser.add_argument("--do_max_proj", action="store_true", default=True,
+    
+    # Handle Boolean argument that can accept explicit True/False values
+    def str_to_bool(v):
+        if isinstance(v, bool):
+            return v
+        if v.lower() in ('yes', 'true', 't', 'y', '1'):
+            return True
+        elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+            return False
+        else:
+            raise argparse.ArgumentTypeError('Boolean value expected.')
+    
+    parser.add_argument("--do_max_proj", type=str_to_bool, nargs='?', const=True, default=True,
                        help="Perform maximum intensity projection along Z axis")
     parser.add_argument("--output_name", type=str, default="processed",
                        help="Name prefix for output plates")
