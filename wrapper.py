@@ -2,8 +2,9 @@
 """
 Minimal OME-ZARR plate processor for biaflows
 
-Simple processor that reads OME-ZARR plates, performs basic operations
-(channel selection, max projection), and saves as OME-ZARR plates.
+Applies Gaussian smoothing (denoising) to every channel/Z-slice of an
+OME-ZARR plate and optionally performs a max-projection along Z.
+All channels are preserved in the output.
 """
 
 import os
@@ -15,6 +16,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import zarr
 import numpy as np
+from scipy.ndimage import gaussian_filter
 from ome_zarr import reader
 from ome_zarr.writer import write_image
 from ome_zarr.io import parse_url
@@ -53,73 +55,67 @@ def find_zarr_plates(input_path):
     return plates
 
 
-def process_zarr_data(data_array, channel=-1, do_max_proj=True):
+def process_zarr_data(data_array, axes=None, gaussian_sigma=2.0, do_max_proj=True):
     """
-    Process the image data array
-    
+    Process the image data array.
+
+    Applies Gaussian smoothing to every YX plane (all channels / Z-slices
+    preserved), then optionally max-projects along Z.
+
     Args:
-        data_array: Input image data (assumed to be in TCZYX or similar format)
-        channel: Channel to extract (-1 for all channels)
-        do_max_proj: Whether to do max projection along Z
-    
+        data_array: Input image data as a numpy array.
+        axes: List of axis dicts or strings from OME-ZARR multiscales metadata.
+        gaussian_sigma: Sigma for Gaussian smoothing applied in YX. 0 disables it.
+        do_max_proj: Collapse Z via max-projection when a Z axis is present.
+
     Returns:
-        Processed array
+        Processed numpy array with the same dtype as the input.
     """
-    logger.info(f"Input array shape: {data_array.shape}")
-    
-    # Assume data is in TCZYX format (time, channel, z, y, x)
-    # or CZYX format (channel, z, y, x)
-    
-    # Handle different dimensionalities
-    if len(data_array.shape) == 5:  # TCZYX
-        t, c, z, y, x = data_array.shape
-        logger.info(f"Data format: TCZYX ({t}, {c}, {z}, {y}, {x})")
-        
-        # Channel selection
-        if channel >= 0 and channel < c:
-            logger.info(f"Selecting channel {channel}")
-            processed = data_array[:, channel:channel+1, :, :, :]  # Keep channel dim
-        else:
-            logger.info("Keeping all channels")
-            processed = data_array
-        
-        # Max projection along Z if requested
-        if do_max_proj and z > 1:
-            logger.info("Performing max projection along Z axis")
-            processed = np.max(processed, axis=2, keepdims=True)  # Keep Z dim with size 1
-        
-    elif len(data_array.shape) == 4:  # CZYX
-        c, z, y, x = data_array.shape
-        logger.info(f"Data format: CZYX ({c}, {z}, {y}, {x})")
-        
-        # Channel selection
-        if channel >= 0 and channel < c:
-            logger.info(f"Selecting channel {channel}")
-            processed = data_array[channel:channel+1, :, :, :]  # Keep channel dim
-        else:
-            logger.info("Keeping all channels")
-            processed = data_array
-        
-        # Max projection along Z if requested
-        if do_max_proj and z > 1:
-            logger.info("Performing max projection along Z axis")
-            processed = np.max(processed, axis=1, keepdims=True)  # Keep Z dim with size 1
-        
-    elif len(data_array.shape) == 3:  # ZYX or CYX
-        if do_max_proj:
-            logger.info("Performing max projection along first axis")
-            processed = np.max(data_array, axis=0, keepdims=True)
-        else:
-            processed = data_array
+    logger.info(f"Input array shape: {data_array.shape}, axes: {axes}")
+
+    # Normalise axes to lower-case name strings
+    if axes is not None:
+        ax = [a['name'].lower() if isinstance(a, dict) else str(a).lower() for a in axes]
     else:
-        logger.info("Data shape not recognized, returning as-is")
-        processed = data_array
-    
+        ndim = len(data_array.shape)
+        ax = {5: ['t','c','z','y','x'], 4: ['c','z','y','x'], 3: ['c','y','x']}.get(ndim, [])
+        logger.info(f"No axes metadata; inferred axes: {ax}")
+
+    logger.info(f"Resolved axes: {ax}")
+
+    processed = data_array.copy().astype(np.float32)
+
+    # --- Gaussian smoothing on every YX plane ---
+    if gaussian_sigma > 0 and 'y' in ax and 'x' in ax:
+        y_idx = ax.index('y')
+        x_idx = ax.index('x')
+        # Build a per-axis sigma: only smooth in Y and X
+        sigma = [gaussian_sigma if i in (y_idx, x_idx) else 0
+                 for i in range(len(ax))]
+        logger.info(f"Applying Gaussian smoothing with sigma={gaussian_sigma} in YX")
+        processed = gaussian_filter(processed, sigma=sigma)
+    else:
+        logger.info("Gaussian smoothing skipped (sigma=0 or no YX axes)")
+
+    # --- Optional max projection along Z ---
+    if 'z' in ax:
+        z_idx = ax.index('z')
+        n_z = processed.shape[z_idx]
+        if do_max_proj and n_z > 1:
+            logger.info(f"Performing max projection along Z axis {z_idx}")
+            processed = np.max(processed, axis=z_idx, keepdims=True)
+        else:
+            logger.info("Z axis has size 1 or max_proj disabled; skipping")
+    elif do_max_proj:
+        logger.info("No Z axis found; skipping max projection")
+
+    # Restore original dtype (Gaussian returns float32)
+    processed = processed.astype(data_array.dtype)
     logger.info(f"Output array shape: {processed.shape}")
     return processed
 
 
-def process_single_zarr(zarr_path, output_dir, channel=-1, do_max_proj=True, output_name="processed"):
+def process_single_zarr(zarr_path, output_dir, gaussian_sigma=2.0, do_max_proj=True, output_name="processed"):
     """Process a single OME-ZARR file"""
     logger.info(f"[{zarr_path.name}] Starting processing...")
     
@@ -136,13 +132,13 @@ def process_single_zarr(zarr_path, output_dir, channel=-1, do_max_proj=True, out
         root_group = zarr.open_group(store=input_store, mode='r')
         if 'plate' in root_group.attrs:
             logger.info(f"[{zarr_path.name}] Processing OME-ZARR plate format")
-            return process_plate_format(zarr_path, output_zarr, root_group, channel, do_max_proj)
+            return process_plate_format(zarr_path, output_zarr, root_group, gaussian_sigma, do_max_proj)
         else:
             logger.info(f"[{zarr_path.name}] Processing single image format")
             # For non-plate format, fall back to ome-zarr reader
             store = parse_url(str(zarr_path), mode="r")
             reader_obj = reader.Reader(store)
-            return process_single_image_format(zarr_path, output_zarr, reader_obj, channel, do_max_proj)
+            return process_single_image_format(zarr_path, output_zarr, reader_obj, gaussian_sigma, do_max_proj)
             
     except Exception as e:
         error_msg = f"[{zarr_path.name}] Failed to process: {str(e)}"
@@ -150,7 +146,7 @@ def process_single_zarr(zarr_path, output_dir, channel=-1, do_max_proj=True, out
         return {"status": "error", "file": zarr_path.name, "error": str(e)}
 
 
-def process_plate_format(zarr_path, output_zarr, root_group, channel, do_max_proj):
+def process_plate_format(zarr_path, output_zarr, root_group, gaussian_sigma, do_max_proj):
     """Process OME-ZARR plate format with wells and fields"""
     plate_info = root_group.attrs['plate']
     wells = plate_info.get('wells', [])
@@ -192,9 +188,15 @@ def process_plate_format(zarr_path, output_zarr, root_group, channel, do_max_pro
                 # Get the highest resolution (usually level 0)
                 data_array = np.array(field_group['0'])  # Level 0 = highest resolution
                 logger.info(f"[{zarr_path.name}] Field {well_path}/{field_path} shape: {data_array.shape}")
-                
+
+                # Extract axes from multiscales metadata
+                field_attrs_raw = dict(field_group.attrs)
+                axes = None
+                if 'multiscales' in field_attrs_raw:
+                    axes = field_attrs_raw['multiscales'][0].get('axes')
+
                 # Process the field data
-                processed_data = process_zarr_data(data_array, channel=channel, do_max_proj=do_max_proj)
+                processed_data = process_zarr_data(data_array, axes=axes, gaussian_sigma=gaussian_sigma, do_max_proj=do_max_proj)
                 
                 # Create output field group with proper single-scale metadata
                 output_field = output_well.create_group(field_path)
@@ -255,7 +257,7 @@ def process_plate_format(zarr_path, output_zarr, root_group, channel, do_max_pro
     return {"status": "success", "file": zarr_path.name, "output": output_zarr}
 
 
-def process_single_image_format(zarr_path, output_zarr, reader_obj, channel, do_max_proj):
+def process_single_image_format(zarr_path, output_zarr, reader_obj, gaussian_sigma, do_max_proj):
     """Process single OME-ZARR image (non-plate format)"""
     # Get the first (and usually only) image
     nodes = list(reader_obj())
@@ -263,18 +265,25 @@ def process_single_image_format(zarr_path, output_zarr, reader_obj, channel, do_
         raise ValueError("No image data found in ZARR file")
     
     image_node = nodes[0]
-    image_data = image_node.data
-    
+    image_data = image_node.data  # list of arrays, one per resolution level
+
+    # Extract axes from OME-ZARR metadata
+    axes = None
+    if hasattr(image_node, 'metadata') and image_node.metadata:
+        axes = image_node.metadata.get('axes')
+
     # Get image data as numpy array (load into memory for processing)
+    # image_data is a multiscale list - take level 0 (highest resolution)
     logger.info(f"[{zarr_path.name}] Loading image data...")
-    if hasattr(image_data, 'compute'):  # dask array
-        data_array = image_data.compute()
+    level0 = image_data[0] if isinstance(image_data, (list, tuple)) else image_data
+    if hasattr(level0, 'compute'):  # dask array
+        data_array = level0.compute()
     else:
-        data_array = np.asarray(image_data)
-    
+        data_array = np.asarray(level0)
+
     # Process the data
     logger.info(f"[{zarr_path.name}] Processing data...")
-    processed_data = process_zarr_data(data_array, channel=channel, do_max_proj=do_max_proj)
+    processed_data = process_zarr_data(data_array, axes=axes, gaussian_sigma=gaussian_sigma, do_max_proj=do_max_proj)
     
     # Write processed data back as OME-ZARR
     logger.info(f"[{zarr_path.name}] Writing processed data to {output_zarr}")
@@ -306,9 +315,9 @@ def parse_args():
     parser.add_argument("-nmc", action="store_true", help="No model cache (compatibility)")
     
     # Processing parameters
-    parser.add_argument("--channel", type=int, default=0, 
-                       help="Channel to extract/process (0-based), -1 for all channels")
-    
+    parser.add_argument("--gaussian_sigma", type=float, default=2.0,
+                       help="Sigma for Gaussian smoothing applied in YX to every plane. Set 0 to disable.")
+
     # Handle Boolean argument that can accept explicit True/False values
     def str_to_bool(v):
         if isinstance(v, bool):
@@ -365,7 +374,7 @@ def main():
                     process_single_zarr,
                     zarr_file,
                     output_path,
-                    channel=args.channel,
+                    gaussian_sigma=args.gaussian_sigma,
                     do_max_proj=args.do_max_proj,
                     output_name=args.output_name
                 ): zarr_file for zarr_file in zarr_plates

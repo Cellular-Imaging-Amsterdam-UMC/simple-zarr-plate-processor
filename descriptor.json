@@ -1,19 +1,19 @@
 {
   "name": "SimpleZarrPlateProcessor",
-  "description": "Minimal OME-ZARR plate processor with max projection and channel selection",
+  "description": "OME-ZARR plate processor: applies Gaussian smoothing to every channel/plane and optionally max-projects along Z",
   "container-image": {
     "image": "cellularimagingcf/simple-zarr-plate-processor",
     "type": "docker"
   },
-  "command-line": "python wrapper.py --infolder [INFOLDER] --outfolder [OUTFOLDER] --gtfolder [GTFOLDER] --local -nmc --channel [CHANNEL] [DO_MAX_PROJ] --output_name [OUTPUT_NAME] --max_workers [MAX_WORKERS]",
+  "command-line": "python wrapper.py --infolder [INFOLDER] --outfolder [OUTFOLDER] --gtfolder [GTFOLDER] --local -nmc --gaussian_sigma [GAUSSIAN_SIGMA] [DO_MAX_PROJ] --output_name [OUTPUT_NAME] --max_workers [MAX_WORKERS]",
   "inputs": [
     {
-      "id": "channel",
-      "value-key": "[CHANNEL]",
-      "command-line-flag": "--channel",
-      "name": "Channel to process",
-      "description": "Channel index to extract/process (0-based), -1 for all channels",
-      "default-value": 0,
+      "id": "gaussian_sigma",
+      "value-key": "[GAUSSIAN_SIGMA]",
+      "command-line-flag": "--gaussian_sigma",
+      "name": "Gaussian sigma",
+      "description": "Sigma for Gaussian smoothing applied in YX to every plane. Set 0 to disable.",
+      "default-value": 2.0,
       "optional": true,
       "type": "Number"
     },
