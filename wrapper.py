@@ -33,24 +33,37 @@ def find_zarr_plates(input_path):
     """Find all OME-ZARR plate files in the input directory"""
     plates = []
     input_path = Path(input_path)
-    
+
     for item in input_path.iterdir():
-        if item.is_dir() and item.name.endswith('.zarr'):
-            # Check if it's a plate by looking for .zattrs with plate metadata
-            zattrs_path = item / '.zattrs'
-            if zattrs_path.exists():
-                try:
-                    store = zarr.DirectoryStore(str(item))
-                    group = zarr.group(store=store)
-                    if 'plate' in group.attrs:
-                        plates.append(item)
-                        logger.info(f"Found OME-ZARR plate: {item.name}")
-                    else:
-                        logger.info(f"Found OME-ZARR (not plate): {item.name}")
-                        plates.append(item)  # Include anyway for processing
-                except Exception as e:
-                    logger.warning(f"Could not read {item.name}: {e}")
-    
+        if not (item.is_dir() and item.name.endswith('.zarr')):
+            continue
+
+        is_v2 = (item / '.zattrs').exists() or (item / '.zgroup').exists()
+        is_v3 = (item / 'zarr.json').exists()
+
+        if not (is_v2 or is_v3):
+            logger.warning(f"Skipping {item.name}: not a recognised zarr store")
+            continue
+
+        if is_v3 and not is_v2:
+            logger.error(
+                f"Skipping {item.name}: Zarr v3 format detected (zarr.json). "
+                "This workflow requires Zarr v2 (OME-ZARR 0.4). "
+                "Re-export from OMERO with: omero zarr --format 0.4 export ..."
+            )
+            continue
+
+        try:
+            store = zarr.DirectoryStore(str(item))
+            group = zarr.group(store=store)
+            if 'plate' in group.attrs:
+                logger.info(f"Found OME-ZARR plate: {item.name}")
+            else:
+                logger.info(f"Found OME-ZARR (not plate): {item.name}")
+            plates.append(item)
+        except Exception as e:
+            logger.warning(f"Could not read {item.name}: {e}")
+
     logger.info(f"Found {len(plates)} ZARR files to process")
     return plates
 
@@ -360,8 +373,9 @@ def main():
         zarr_plates = find_zarr_plates(input_path)
         
         if not zarr_plates:
-            logger.warning("No OME-ZARR plates found in input directory")
-            return
+            logger.error("No processable OME-ZARR files found in input directory. "
+                         "Ensure inputs are Zarr v2 / OME-ZARR 0.4 format.")
+            sys.exit(1)
         
         # Process plates in parallel
         logger.info(f"Processing {len(zarr_plates)} plates using {args.max_workers} parallel workers")
