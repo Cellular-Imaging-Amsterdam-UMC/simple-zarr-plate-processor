@@ -1,19 +1,19 @@
 {
   "name": "SimpleZarrPlateProcessor",
-  "description": "OME-ZARR plate processor: applies Gaussian smoothing to every channel/plane and optionally max-projects along Z",
+  "description": "OME-ZARR plate processor: applies Sobel edge detection to every channel/plane, with optional Gaussian pre-smoothing, max-projection along Z, and per-channel contrast normalization",
   "container-image": {
     "image": "cellularimagingcf/simple-zarr-plate-processor",
     "type": "docker"
   },
-  "command-line": "python wrapper.py --infolder [INFOLDER] --outfolder [OUTFOLDER] --gtfolder [GTFOLDER] --local -nmc --gaussian_sigma [GAUSSIAN_SIGMA] [DO_MAX_PROJ] --output_name [OUTPUT_NAME] --max_workers [MAX_WORKERS]",
+  "command-line": "python wrapper.py --infolder [INFOLDER] --outfolder [OUTFOLDER] --gtfolder [GTFOLDER] --local -nmc --gaussian_sigma [GAUSSIAN_SIGMA] [DO_MAX_PROJ] [NORMALIZE_CONTRAST] --output_name [OUTPUT_NAME] --max_workers [MAX_WORKERS]",
   "inputs": [
     {
       "id": "gaussian_sigma",
       "value-key": "[GAUSSIAN_SIGMA]",
       "command-line-flag": "--gaussian_sigma",
-      "name": "Gaussian sigma",
-      "description": "Sigma for Gaussian smoothing applied in YX to every plane. Set 0 to disable.",
-      "default-value": 2.0,
+      "name": "Pre-smoothing sigma",
+      "description": "Sigma for Gaussian pre-smoothing applied before Sobel edge detection. Reduces noise. Set 0 to skip.",
+      "default-value": 1.0,
       "optional": true,
       "type": "Number"
     },
@@ -23,6 +23,16 @@
       "command-line-flag": "--do_max_proj",
       "name": "Max projection",
       "description": "Perform maximum intensity projection along Z axis",
+      "default-value": true,
+      "optional": true,
+      "type": "Boolean"
+    },
+    {
+      "id": "normalize_contrast",
+      "value-key": "[NORMALIZE_CONTRAST]",
+      "command-line-flag": "--normalize_contrast",
+      "name": "Normalize contrast",
+      "description": "Stretch each channel to full dtype range using 2nd-98th percentile clipping. Makes the processing effect clearly visible.",
       "default-value": true,
       "optional": true,
       "type": "Boolean"

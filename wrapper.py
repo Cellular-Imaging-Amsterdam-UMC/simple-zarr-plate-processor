@@ -2,7 +2,7 @@
 """
 Minimal OME-ZARR plate processor for biaflows
 
-Applies Gaussian smoothing (denoising) to every channel/Z-slice of an
+Applies Sobel edge detection to every channel/Z-slice of an
 OME-ZARR plate and optionally performs a max-projection along Z.
 All channels are preserved in the output.
 """
@@ -16,7 +16,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import zarr
 import numpy as np
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, sobel
 from ome_zarr import reader
 from ome_zarr.writer import write_image
 from ome_zarr.io import parse_url
@@ -68,18 +68,51 @@ def find_zarr_plates(input_path):
     return plates
 
 
-def process_zarr_data(data_array, axes=None, gaussian_sigma=2.0, do_max_proj=True):
+def normalize_contrast_per_channel(array, ax, dtype):
+    """
+    Stretch each channel to the full dtype range using 2nd–98th percentile clipping.
+    Works for any axis layout that contains a 'c' axis, or treats the whole
+    array as a single channel when no 'c' axis is present.
+    """
+    out = array.astype(np.float32)
+    info = np.iinfo(dtype) if np.issubdtype(dtype, np.integer) else np.finfo(dtype)
+    dtype_min, dtype_max = float(info.min), float(info.max)
+
+    if 'c' in ax:
+        c_idx = ax.index('c')
+        n_channels = out.shape[c_idx]
+        for c in range(n_channels):
+            slices = [slice(None)] * len(ax)
+            slices[c_idx] = c
+            plane = out[tuple(slices)]
+            lo, hi = np.percentile(plane, (2, 98))
+            if hi > lo:
+                out[tuple(slices)] = np.clip((plane - lo) / (hi - lo), 0, 1) * (dtype_max - dtype_min) + dtype_min
+            logger.info(f"Channel {c}: stretched [{lo:.1f}, {hi:.1f}] -> [{dtype_min:.0f}, {dtype_max:.0f}]")
+    else:
+        lo, hi = np.percentile(out, (2, 98))
+        if hi > lo:
+            out = np.clip((out - lo) / (hi - lo), 0, 1) * (dtype_max - dtype_min) + dtype_min
+        logger.info(f"Single channel: stretched [{lo:.1f}, {hi:.1f}] -> [{dtype_min:.0f}, {dtype_max:.0f}]")
+
+    return out.astype(dtype)
+
+
+def process_zarr_data(data_array, axes=None, gaussian_sigma=1.0, do_max_proj=True, normalize_contrast=True):
     """
     Process the image data array.
 
-    Applies Gaussian smoothing to every YX plane (all channels / Z-slices
-    preserved), then optionally max-projects along Z.
+    Applies Sobel edge detection to every YX plane (all channels / Z-slices
+    preserved). Optional Gaussian pre-smoothing reduces noise before edge
+    detection. Optionally max-projects along Z and normalizes contrast.
 
     Args:
         data_array: Input image data as a numpy array.
         axes: List of axis dicts or strings from OME-ZARR multiscales metadata.
-        gaussian_sigma: Sigma for Gaussian smoothing applied in YX. 0 disables it.
+        gaussian_sigma: Sigma for Gaussian pre-smoothing before edge detection.
+                        Set 0 to skip pre-smoothing.
         do_max_proj: Collapse Z via max-projection when a Z axis is present.
+        normalize_contrast: Stretch each channel to full dtype range (2–98th percentile).
 
     Returns:
         Processed numpy array with the same dtype as the input.
@@ -98,17 +131,30 @@ def process_zarr_data(data_array, axes=None, gaussian_sigma=2.0, do_max_proj=Tru
 
     processed = data_array.copy().astype(np.float32)
 
-    # --- Gaussian smoothing on every YX plane ---
-    if gaussian_sigma > 0 and 'y' in ax and 'x' in ax:
+    # --- Sobel edge detection on every YX plane ---
+    if 'y' in ax and 'x' in ax:
         y_idx = ax.index('y')
         x_idx = ax.index('x')
-        # Build a per-axis sigma: only smooth in Y and X
-        sigma = [gaussian_sigma if i in (y_idx, x_idx) else 0
-                 for i in range(len(ax))]
-        logger.info(f"Applying Gaussian smoothing with sigma={gaussian_sigma} in YX")
-        processed = gaussian_filter(processed, sigma=sigma)
+        logger.info(f"Applying Sobel edge detection (pre-smooth sigma={gaussian_sigma})")
+
+        # Move YX to last two positions so we can iterate over all other dims
+        other_axes = [i for i in range(len(ax)) if i not in (y_idx, x_idx)]
+        transposed = np.moveaxis(processed, [y_idx, x_idx], [-2, -1])
+        orig_shape = transposed.shape
+        flat = transposed.reshape(-1, orig_shape[-2], orig_shape[-1])
+
+        result_planes = []
+        for plane in flat:
+            if gaussian_sigma > 0:
+                plane = gaussian_filter(plane, sigma=gaussian_sigma)
+            sx = sobel(plane, axis=0)
+            sy = sobel(plane, axis=1)
+            result_planes.append(np.hypot(sx, sy))
+
+        edges = np.stack(result_planes).reshape(orig_shape)
+        processed = np.moveaxis(edges, [-2, -1], [y_idx, x_idx])
     else:
-        logger.info("Gaussian smoothing skipped (sigma=0 or no YX axes)")
+        logger.info("No YX axes found; skipping edge detection")
 
     # --- Optional max projection along Z ---
     if 'z' in ax:
@@ -122,13 +168,19 @@ def process_zarr_data(data_array, axes=None, gaussian_sigma=2.0, do_max_proj=Tru
     elif do_max_proj:
         logger.info("No Z axis found; skipping max projection")
 
-    # Restore original dtype (Gaussian returns float32)
-    processed = processed.astype(data_array.dtype)
+    # --- Optional contrast normalization per channel ---
+    if normalize_contrast:
+        logger.info("Applying per-channel contrast normalization (2nd–98th percentile)")
+        processed = normalize_contrast_per_channel(processed, ax, data_array.dtype)
+    else:
+        # Restore original dtype (Gaussian returns float32)
+        processed = processed.astype(data_array.dtype)
+
     logger.info(f"Output array shape: {processed.shape}")
     return processed
 
 
-def process_single_zarr(zarr_path, output_dir, gaussian_sigma=2.0, do_max_proj=True, output_name="processed"):
+def process_single_zarr(zarr_path, output_dir, gaussian_sigma=1.0, do_max_proj=True, normalize_contrast=True, output_name="processed"):
     """Process a single OME-ZARR file"""
     logger.info(f"[{zarr_path.name}] Starting processing...")
     
@@ -145,13 +197,13 @@ def process_single_zarr(zarr_path, output_dir, gaussian_sigma=2.0, do_max_proj=T
         root_group = zarr.open_group(store=input_store, mode='r')
         if 'plate' in root_group.attrs:
             logger.info(f"[{zarr_path.name}] Processing OME-ZARR plate format")
-            return process_plate_format(zarr_path, output_zarr, root_group, gaussian_sigma, do_max_proj)
+            return process_plate_format(zarr_path, output_zarr, root_group, gaussian_sigma, do_max_proj, normalize_contrast)
         else:
             logger.info(f"[{zarr_path.name}] Processing single image format")
             # For non-plate format, fall back to ome-zarr reader
             store = parse_url(str(zarr_path), mode="r")
             reader_obj = reader.Reader(store)
-            return process_single_image_format(zarr_path, output_zarr, reader_obj, gaussian_sigma, do_max_proj)
+            return process_single_image_format(zarr_path, output_zarr, reader_obj, gaussian_sigma, do_max_proj, normalize_contrast)
             
     except Exception as e:
         error_msg = f"[{zarr_path.name}] Failed to process: {str(e)}"
@@ -159,7 +211,7 @@ def process_single_zarr(zarr_path, output_dir, gaussian_sigma=2.0, do_max_proj=T
         return {"status": "error", "file": zarr_path.name, "error": str(e)}
 
 
-def process_plate_format(zarr_path, output_zarr, root_group, gaussian_sigma, do_max_proj):
+def process_plate_format(zarr_path, output_zarr, root_group, gaussian_sigma, do_max_proj, normalize_contrast=True):
     """Process OME-ZARR plate format with wells and fields"""
     plate_info = root_group.attrs['plate']
     wells = plate_info.get('wells', [])
@@ -209,7 +261,7 @@ def process_plate_format(zarr_path, output_zarr, root_group, gaussian_sigma, do_
                     axes = field_attrs_raw['multiscales'][0].get('axes')
 
                 # Process the field data
-                processed_data = process_zarr_data(data_array, axes=axes, gaussian_sigma=gaussian_sigma, do_max_proj=do_max_proj)
+                processed_data = process_zarr_data(data_array, axes=axes, gaussian_sigma=gaussian_sigma, do_max_proj=do_max_proj, normalize_contrast=normalize_contrast)
                 
                 # Create output field group with proper single-scale metadata
                 output_field = output_well.create_group(field_path)
@@ -270,7 +322,7 @@ def process_plate_format(zarr_path, output_zarr, root_group, gaussian_sigma, do_
     return {"status": "success", "file": zarr_path.name, "output": output_zarr}
 
 
-def process_single_image_format(zarr_path, output_zarr, reader_obj, gaussian_sigma, do_max_proj):
+def process_single_image_format(zarr_path, output_zarr, reader_obj, gaussian_sigma, do_max_proj, normalize_contrast=True):
     """Process single OME-ZARR image (non-plate format)"""
     # Get the first (and usually only) image
     nodes = list(reader_obj())
@@ -296,7 +348,7 @@ def process_single_image_format(zarr_path, output_zarr, reader_obj, gaussian_sig
 
     # Process the data
     logger.info(f"[{zarr_path.name}] Processing data...")
-    processed_data = process_zarr_data(data_array, axes=axes, gaussian_sigma=gaussian_sigma, do_max_proj=do_max_proj)
+    processed_data = process_zarr_data(data_array, axes=axes, gaussian_sigma=gaussian_sigma, do_max_proj=do_max_proj, normalize_contrast=normalize_contrast)
     
     # Write processed data back as OME-ZARR
     logger.info(f"[{zarr_path.name}] Writing processed data to {output_zarr}")
@@ -328,8 +380,8 @@ def parse_args():
     parser.add_argument("-nmc", action="store_true", help="No model cache (compatibility)")
     
     # Processing parameters
-    parser.add_argument("--gaussian_sigma", type=float, default=2.0,
-                       help="Sigma for Gaussian smoothing applied in YX to every plane. Set 0 to disable.")
+    parser.add_argument("--gaussian_sigma", type=float, default=1.0,
+                       help="Sigma for Gaussian pre-smoothing before Sobel edge detection. Set 0 to disable.")
 
     # Handle Boolean argument that can accept explicit True/False values
     def str_to_bool(v):
@@ -344,6 +396,8 @@ def parse_args():
     
     parser.add_argument("--do_max_proj", type=str_to_bool, nargs='?', const=True, default=True,
                        help="Perform maximum intensity projection along Z axis")
+    parser.add_argument("--normalize_contrast", type=str_to_bool, nargs='?', const=True, default=True,
+                       help="Stretch each channel to full dtype range using 2nd-98th percentile clipping")
     parser.add_argument("--output_name", type=str, default="processed",
                        help="Name prefix for output plates")
     parser.add_argument("--max_workers", type=int, default=4,
@@ -390,6 +444,7 @@ def main():
                     output_path,
                     gaussian_sigma=args.gaussian_sigma,
                     do_max_proj=args.do_max_proj,
+                    normalize_contrast=args.normalize_contrast,
                     output_name=args.output_name
                 ): zarr_file for zarr_file in zarr_plates
             }
